@@ -1,0 +1,162 @@
+---
+output: 
+  html_document:
+    css: custom.css
+---
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, include=FALSE}
+library(RMySQL)
+library(RNeo4j)
+library(tidyverse)
+library(knitr)
+
+sql.password <- 'cosmic joke'
+neo4j.password <- 'asdfasdf'
+```
+
+<div class='jumbotron'>
+  <h2 class='display-3 text-uppercase'>Assignment 8</h2>
+  <h4 class='right text-uppercase'>By Brian Weinfeld</h4>
+  <div class='clearfix'></div>
+  <h5 class='right text-uppercase'>April 26th, 2018</h5>
+</div>
+
+<div class='page-header text-uppercase'>
+  <h3>mySQL to Neo4j</h3>
+</div>
+
+<div class='well'>
+I decided to revist the mySQL tables created in assignment number 2. In that assignment, I asked all my students to review the top six movies of 2017 on a scale from 1 to 5. The data was read into R, tidied and written directly to an SQL database. 
+
+For this project, I will read in the data, create a Neo4j graph and use the graph to make recommendations for my students.
+</div>
+
+```{r}
+mydb <- dbConnect(MySQL(), user='root', 
+                  password=sql.password, 
+                  dbname='week2assignment', 
+                  host='localhost')
+
+all.data <- dbSendQuery(mydb, 'SELECT users.user_id AS id, users.email, reviews.movie AS title, 
+                               reviews.rating FROM users 
+                               JOIN reviews ON users.user_id = reviews.user_id'
+                        ) %>%
+  fetch() %>%
+  filter(!is.na(rating))
+all.data[1:10, ] %>% kable()
+```
+
+<div class='well'>
+Each line represents one student's review of one movie. Movie that they have not reviewed were stored in the SQL database but have been removed here as they will not be represented in the Neo4j graph.
+</div>
+
+```{r}
+graph <- startGraph('http://localhost:7474/db/data/', username='neo4j', password=neo4j.password)
+
+#clear(graph)
+
+addConstraint(graph, 'User', 'email')
+addConstraint(graph, 'User', 'id')
+addConstraint(graph, 'Movie', 'title')
+```
+
+<div class='well'>
+I connected to Neo4j, cleared the graph and added the uniqueness constraints to the graph. Each user is identified by their email and id while each movie is represented by it's title.
+</div>
+
+```{r}
+query <- '
+MERGE (user:User {id: {id}, email:{email}})
+MERGE (movie:Movie {title: {title}})
+CREATE (user)-[r:REVIEWS]->(movie)
+SET r.rating = TOINT({rating})
+'
+tx <- newTransaction(graph)
+
+for(i in 1:nrow(all.data)){
+  row <- all.data[i, ]
+  appendCypher(tx, query,
+               email = row$email,
+               id = row$id,
+               rating = row$rating,
+               title = row$title)
+}
+
+commit(tx)
+
+summary(graph)
+```
+
+<div class='well'>
+The above script inserts all the user and movie nodes and makes the appropriate review connections. Each connection has a rating attribute. After running the script, my Neo4j graph is ready for querying. The complete graph is below.
+</div>
+
+whole graph image
+
+<div class='page-header text-uppercase'>
+  <h3>Query</h3>
+</div>
+
+<div class='well'>
+I began with a simple query designed to identify coun all the identical ratings between every pair of users. 
+</div>
+
+```{r}
+cypher.query <- cypher(graph, 'MATCH (u:User)-[r:REVIEWS]->(m:Movie), 
+                       (u2:User)-[r2:REVIEWS]->(m:Movie) 
+                       WHERE u.id <> u2.id 
+                       AND r.rating = r2.rating 
+                       RETURN u.id, u2.id, COUNT(*) AS count;') %>%
+  group_by(u.id) %>%
+  filter(count == max(count)) %>%
+  arrange(u.id, u2.id)
+cypher.query[1:10, ] %>% kable()
+```
+
+<div class='well'>
+I decided to build on this by making a very basic recommendor system. I created a function that accepts a user id and displays movie recommendations. This works by making two queries to my Neo4j graph. The first identifies all the users who share the largest number of identical ratings as the indicated user. The second query finds all the movies the indentified users have seen that the original user hasn't and returns them ordered by the average score those users gave the movie.
+</div>
+
+```{r}
+Recommendation <- function(id){
+  best.matches <- cypher(graph, 'MATCH (u:User {id: {id}})-[r:REVIEWS]->(m:Movie), 
+                                 (u2:User)-[r2:REVIEWS]->(m:Movie) 
+                                 WHERE u.id <> u2.id 
+                                 AND r.rating = r2.rating 
+                                 RETURN u2.id, COUNT(*) AS count;',
+                         id=id) %>%
+    filter(count == max(count)) %>%
+    select(u2.id) %>%
+    unlist() %>%
+    as.numeric()
+  if(length(best.matches) == 0){
+    print('You have no similar users!')
+    return
+  }
+  recs <- cypher(graph, 'MATCH (u2:User)-[r2:REVIEWS]->(m2:Movie)
+                         WHERE u2.id IN {best}
+                         AND NOT((:User {id:{id}})-[:REVIEWS]->(m2))
+                         RETURN m2.title, AVG(r2.rating) AS avg
+                         ORDER BY avg DESC',
+                 id = id,
+                 best = best.matches)
+  if(is.null(recs)){
+    print('Your similar users have no suggestions!')
+    return
+  }
+  print('Recommendations:')
+  print(recs)
+}
+
+output <- Recommendation(64)
+```
+
+<div class='well'>
+This recommendor system is incredibly basic and has many shortcomings that should be improved before being used to make serious recommendations. However, as a proof of concept, it is able to query the appropriate information. The below graph provides a visual of the indicated user (64) and the recommendations made by the system.
+</div>
+
+image recommendation
+
+<div class='alert alert-success'>
+The data has been successfully transfered from mySQL to RNeo4j via R and has been successfully queried. A small recommendation system has been created as a proof of concept.
+</div>
